@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+
+VM_HOST="$VMGPUTOP_HOST"       # add to your env: export VMGPUTOP_HOST="user@ip"
+VM_LOGPATH="$VMGPUTOP_LOGPATH" # path to log file on VM
+INTERACTIVE_MODE=FALSE         # if using power-mode/Afterburner profile toggle
+VM_SCRIPT="$VMGPUTOP_SCRIPT"   # if using INTERACTIVE_MODE
+MEM_CLOCK_MULTIPLIER=4         # GDDR6 effective rate multiplier
+MEM_CLOCK_BOOST=500            # Manual memory overclock (MHz, added to max)
+REFRESH_RATE=1
+VOLTAGE_MIN=0.7
+VOLTAGE_MAX=0.97
+TEMP_MIN=35
+ORIGINAL_STTY=""
+BOX_INNER_WIDTH=47
+HORIZONTAL_CHAR="─"
+BAR_WIDTH=22
+
+C_RESET="\033[0m"
+C_FG="\033[38;2;$(printf "%d;%d;%d" 0x${FG:1:2} 0x${FG:3:2} 0x${FG:5:2})m"
+C_AQUA="\033[38;2;$(printf "%d;%d;%d" 0x${AQUA:1:2} 0x${AQUA:3:2} 0x${AQUA:5:2})m"
+C_GREEN="\033[38;2;$(printf "%d;%d;%d" 0x${GREEN:1:2} 0x${GREEN:3:2} 0x${GREEN:5:2})m"
+C_YELLOW="\033[38;2;$(printf "%d;%d;%d" 0x${YELLOW:1:2} 0x${YELLOW:3:2} 0x${YELLOW:5:2})m"
+C_RED="\033[38;2;$(printf "%d;%d;%d" 0x${RED:1:2} 0x${RED:3:2} 0x${RED:5:2})m"
+C_ORANGE="\033[38;2;$(printf "%d;%d;%d" 0x${ORANGE:1:2} 0x${ORANGE:3:2} 0x${ORANGE:5:2})m"
+C_DIM="\033[38;2;$(printf "%d;%d;%d" 0x${BG4:1:2} 0x${BG4:3:2} 0x${BG4:5:2})m"
+
+top_border() {
+    local title="$1"
+    local title_visible
+    title_visible=$(echo -e "$title" | sed 's/\x1b\[[0-9;]*m//g')
+    local title_len=${#title_visible}
+    local total_dashes=$((BOX_INNER_WIDTH - title_len - 4))
+    if ((total_dashes < 2)); then
+        local max_title_len=$((BOX_INNER_WIDTH - 6))
+        title="${title:0:$max_title_len}"
+        title_visible="${title}"
+        title_len=${#title_visible}
+        total_dashes=$((BOX_INNER_WIDTH - title_len - 4))
+    fi
+
+    local left_dashes=2
+    local right_dashes=$((total_dashes - left_dashes + 2))
+
+    printf " %s┌%s %s %s┐%s " \
+        "${C_FG}" \
+        "$(printf '%*s' $left_dashes '' | sed 's/ /─/g')" \
+        "$title" \
+        "$(printf '%*s' $right_dashes '' | sed 's/ /─/g')" \
+        "${C_RESET}"
+
+}
+empty_line() {
+    printf " %s│%*s│%s " "${C_FG}" $BOX_INNER_WIDTH "" "${C_RESET}"
+}
+
+bottom_border() {
+    printf " %s└%s┘%s " \
+        "${C_FG}" \
+        "$(printf '%*s' $BOX_INNER_WIDTH '' | sed "s/ /$HORIZONTAL_CHAR/g")" \
+        "${C_RESET}"
+}
+
+clear_screen() { tput clear; }
+hide_cursor() { tput civis; }
+show_cursor() { tput cnorm; }
+move_cursor_home() { tput home; }
+
+draw_line() {
+    local formatted
+    printf -v formatted -- "$@"
+    printf "%b" "$formatted"
+    tput el
+    printf "\n"
+}
+
+enter_monitor_mode() {
+    hide_cursor
+    stty -echo -icanon min 0 time 0 2>/dev/null || true
+}
+
+restore_terminal_state() {
+    if [[ -n "$ORIGINAL_STTY" ]]; then
+        stty "$ORIGINAL_STTY" 2>/dev/null || true
+    else
+        stty sane 2>/dev/null || true
+    fi
+    show_cursor
+}
+
+render_bar() {
+    local percent=$1
+    ((percent < 0)) && percent=0
+    ((percent > 100)) && percent=100
+    local filled=$((percent * BAR_WIDTH / 100))
+    local empty=$((BAR_WIDTH - filled))
+    local bar="$C_AQUA"
+    for ((i = 0; i < filled; i++)); do
+        bar+="█"
+    done
+    bar+="$C_DIM"
+    for ((i = 0; i < empty; i++)); do
+        bar+="░"
+    done
+    bar+="$C_RESET"
+    printf "%s" "$bar"
+}
+
+# Color based on percentage (temp, utilization, etc.)
+color_by_percent() {
+    local val=$1
+    if [[ $val -ge 80 ]]; then
+        echo "$C_RED"
+    elif [[ $val -ge 60 ]]; then
+        echo "$C_ORANGE"
+    elif [[ $val -ge 40 ]]; then
+        echo "$C_YELLOW"
+    else
+        echo "$C_GREEN"
+    fi
+}
+
+# Fetch static GPU info from nvidia-smi
+init_gpu_info() {
+    local gpu_info
+    gpu_info=$(ssh -q "$VM_HOST" "nvidia-smi --query-gpu=name,power.max_limit,clocks.max.graphics,clocks.max.memory --format=csv,noheader" 2>/dev/null | tr -d '\r') || true
+
+    IFS=',' read -r name max_power max_gpu_clock max_mem_clock <<<"$gpu_info"
+
+    GPU_NAME=$(echo "$name" | xargs)
+    [[ -z "$GPU_NAME" ]] && GPU_NAME="NVIDIA GPU"
+
+    max_power=$(echo "$max_power" | xargs | sed 's/ W//')
+    if [[ "$max_power" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+        POWER_LIMIT=$(printf "%.0f" "$max_power")
+    fi
+
+    max_gpu_clock=$(echo "$max_gpu_clock" | xargs | sed 's/ MHz//')
+    if [[ "$max_gpu_clock" =~ ^[0-9]+$ ]]; then
+        GPU_CLOCK_MAX=$max_gpu_clock
+    fi
+
+    max_mem_clock=$(echo "$max_mem_clock" | xargs | sed 's/ MHz//')
+    if [[ "$max_mem_clock" =~ ^[0-9]+$ ]]; then
+        MEM_CLOCK_MAX=$((max_mem_clock + MEM_CLOCK_BOOST))
+    fi
+}
+
+fetch_gpu_stats() {
+    # CSV columns: Date[0],Time[1],Temp[2],ThermalLimit[3],Voltage[4],FanRPM[5],Power[6],
+    #              GPUClock[7],MemClock[8],Fan%[9],MemAvail[10],MemAlloc[11],GPULoad[12]
+    local csv_line
+    csv_line=$(ssh -q "$VM_HOST" "powershell -NoProfile -Command \"(Get-Content $VM_LOGPATH -Tail 1)\"" 2>/dev/null | tr -d '\r') || true
+
+    IFS=',' read -r _date _time temp thermal_limit voltage fan_rpm power_draw gpu_clock mem_clock gpu_load fan_percent mem_available mem_allocated _rest <<<"$csv_line"
+
+    # Clean up values
+    temp=$(echo "$temp" | xargs)
+    thermal_limit=$(echo "$thermal_limit" | xargs)
+    voltage=$(echo "$voltage" | xargs)
+    fan_rpm=$(echo "$fan_rpm" | xargs)
+    power_draw=$(echo "$power_draw" | xargs)
+    gpu_clock=$(echo "$gpu_clock" | xargs)
+    mem_clock=$(echo "$mem_clock" | xargs)
+    fan_percent=$(echo "$fan_percent" | xargs)
+    mem_available=$(echo "$mem_available" | xargs)
+    mem_allocated=$(echo "$mem_allocated" | xargs)
+    gpu_load=$(echo "$gpu_load" | xargs)
+
+    # Validate
+    [[ ! "$temp" =~ ^[0-9]+\.?[0-9]*$ ]] && temp=0
+    [[ ! "$thermal_limit" =~ ^[0-9]+\.?[0-9]*$ ]] && thermal_limit=0
+    [[ ! "$voltage" =~ ^[0-9]+\.?[0-9]*$ ]] && voltage=0
+    [[ ! "$fan_rpm" =~ ^[0-9]+\.?[0-9]*$ ]] && fan_rpm=0
+    [[ ! "$power_draw" =~ ^[0-9]+\.?[0-9]*$ ]] && power_draw=0
+    [[ ! "$gpu_clock" =~ ^[0-9]+\.?[0-9]*$ ]] && gpu_clock=0
+    [[ ! "$mem_clock" =~ ^[0-9]+\.?[0-9]*$ ]] && mem_clock=0
+    [[ ! "$fan_percent" =~ ^[0-9]+\.?[0-9]*$ ]] && fan_percent=0
+    [[ ! "$mem_available" =~ ^[0-9]+\.?[0-9]*$ ]] && mem_available=1
+    [[ ! "$mem_allocated" =~ ^[0-9]+\.?[0-9]*$ ]] && mem_allocated=0
+    [[ ! "$gpu_load" =~ ^[0-9]+\.?[0-9]*$ ]] && gpu_load=0
+
+    # Calculate
+    local mem_total_mb
+    mem_total_mb=$(awk "BEGIN {printf \"%.0f\", $mem_available + $mem_allocated}")
+    [[ "$mem_total_mb" -eq 0 ]] && mem_total_mb=1
+    mem_used_gb=$(awk "BEGIN {printf \"%.1f\", $mem_allocated / 1024}")
+    mem_total_gb=$(awk "BEGIN {printf \"%.1f\", $mem_total_mb / 1024}")
+    mem_percent=$(awk "BEGIN {v=$mem_allocated * 100 / $mem_total_mb; if(v>100)v=100; printf \"%.0f\", v}")
+
+    # Temperature
+    local temp_range=$((${thermal_limit%.*} - TEMP_MIN))
+    [[ "$temp_range" -le 0 ]] && temp_range=1
+    temp_percent=$(awk "BEGIN {v=($temp - $TEMP_MIN) * 100 / $temp_range; if(v<0)v=0; if(v>100)v=100; printf \"%.0f\", v}")
+    thermal_limit=$(printf "%.0f°C" "$thermal_limit")
+
+    # Voltage
+    voltage_percent=$(awk "BEGIN {v=($voltage - $VOLTAGE_MIN) * 100 / ($VOLTAGE_MAX - $VOLTAGE_MIN); if(v<0)v=0; if(v>100)v=100; printf \"%.0f\", v}")
+
+    # Power
+    local pwr_limit=${POWER_LIMIT:-1}
+    [[ "$pwr_limit" -eq 0 ]] && pwr_limit=1
+    power_percent=$(awk "BEGIN {v=$power_draw * 100 / $pwr_limit; if(v>100)v=100; printf \"%.0f\", v}")
+
+    # Clock
+    local gpu_max=${GPU_CLOCK_MAX:-1}
+    local mem_max=${MEM_CLOCK_MAX:-1}
+    [[ "$gpu_max" -eq 0 ]] && gpu_max=1
+    [[ "$mem_max" -eq 0 ]] && mem_max=1
+    gpu_clock_percent=$(awk "BEGIN {v=$gpu_clock * 100 / $gpu_max; if(v>100)v=100; printf \"%.0f\", v}")
+    mem_clock_percent=$(awk "BEGIN {v=$mem_clock * 100 / ($mem_max / $MEM_CLOCK_MULTIPLIER); if(v>100)v=100; printf \"%.0f\", v}")
+
+    # Fan and GPU load
+    fan_percent=$(printf "%.0f" "$fan_percent")
+    gpu_load=$(printf "%.0f" "$gpu_load")
+}
+
+draw_ui() {
+    move_cursor_home
+
+    fetch_gpu_stats
+
+    local power_mode mode_color
+    if [[ "$INTERACTIVE_MODE" == "TRUE" ]]; then
+        power_mode=$(get_power_mode)
+        [[ "$power_mode" == "Boost" ]] && mode_color="$C_ORANGE" || mode_color="$C_GREEN"
+    fi
+
+    local temp_color gpu_color mem_color mem_clock_color pwr_color fan_color voltage_color
+    temp_color=$(color_by_percent "$temp_percent")
+    gpu_color=$(color_by_percent "$gpu_load")
+    mem_color=$(color_by_percent "$mem_percent")
+    mem_clock_color=$(color_by_percent "$mem_clock_percent")
+    pwr_color=$(color_by_percent "$power_percent")
+    fan_color=$(color_by_percent "$fan_percent")
+    voltage_color=$(color_by_percent "$voltage_percent")
+
+    local temp_bar gpu_bar mem_bar mem_clock_bar power_bar fan_bar voltage_bar
+    temp_bar=$(render_bar "$temp_percent")
+    gpu_bar=$(render_bar "$gpu_load")
+    mem_bar=$(render_bar "$mem_percent")
+    mem_clock_bar=$(render_bar "$mem_clock_percent")
+    power_bar=$(render_bar "$power_percent")
+    fan_bar=$(render_bar "$fan_percent")
+    voltage_bar=$(render_bar "$voltage_percent")
+
+    local temp_display fan_rpm_display gpu_clock_display mem_clock_display voltage_display
+    temp_display=$(printf "%5.0f°C" "$temp")
+    fan_rpm_display=$(printf "%.0f RPM" "$fan_rpm")
+    gpu_clock_display=$(printf "%.0f MHz" "$gpu_clock")
+    mem_clock_display=$(printf "%.0f MHz" "$(awk "BEGIN {printf \"%.0f\", $mem_clock * $MEM_CLOCK_MULTIPLIER}")")
+    voltage_display=$(printf "%.3f V" "$voltage")
+
+    local title="${C_AQUA}${GPU_NAME:-NVIDIA GPU}${C_FG}"
+    if [[ "$INTERACTIVE_MODE" == "TRUE" ]]; then
+        title+=" ${mode_color}[${power_mode}]${C_FG}"
+    fi
+    draw_line "$(top_border "$title")"
+    draw_line "$(empty_line)"
+    draw_line " ${C_FG}│ ${C_DIM}%-8s${temp_color}%9s %s ${C_FG}%6s │${C_RESET} " \
+        "Temp" \
+        "$temp_display" \
+        "$temp_bar" \
+        "$thermal_limit"
+    draw_line " ${C_FG}│ ${C_DIM}%-8s${C_FG}%8s %s ${fan_color}%4s%%${C_FG} │${C_RESET} " \
+        "Fan" \
+        "$fan_rpm_display" \
+        "$fan_bar" \
+        "$fan_percent"
+    draw_line " ${C_FG}│ ${C_DIM}%-8s${C_FG}%8s %s ${gpu_color}%4s%%${C_FG} │${C_RESET} " \
+        "GPU" \
+        "$gpu_clock_display" \
+        "$gpu_bar" \
+        "$gpu_load"
+    draw_line " ${C_FG}│ ${C_DIM}%-8s${C_FG}%8s %s ${mem_color}%4s%%${C_FG} │${C_RESET} " \
+        "Mem" \
+        "${mem_used_gb}/${mem_total_gb}G" \
+        "$mem_bar" \
+        "$mem_percent"
+    draw_line " ${C_FG}│ ${C_DIM}%-8s${C_FG}%8s %s ${mem_clock_color}%4s%%${C_FG} │${C_RESET} " \
+        "MemClk" \
+        "$mem_clock_display" \
+        "$mem_clock_bar" \
+        "$mem_clock_percent"
+    draw_line " ${C_FG}│ ${C_DIM}%-8s${C_FG}%8s %s ${pwr_color}%4s%%${C_FG} │${C_RESET} " \
+        "Power" \
+        "$(printf '%.0f/%.0fW' "$power_draw" "${POWER_LIMIT:-115}")" \
+        "$power_bar" \
+        "$power_percent"
+    draw_line " ${C_FG}│ ${C_DIM}%-8s${C_FG}%8s %s ${voltage_color}%4s%%${C_FG} │${C_RESET} " \
+        "Volt" \
+        "$voltage_display" \
+        "$voltage_bar" \
+        "$voltage_percent"
+    draw_line "$(empty_line)"
+    printf "%b" "$(bottom_border)"
+    tput el
+}
+
+# Get power mode status [INTERACTIVE_MODE]
+get_power_mode() {
+    if grep -qw "performance" /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null; then
+        echo "Boost"
+    else
+        echo "Light"
+    fi
+}
+
+handle_input() {
+    local key
+    read -t 0.01 -n 1 key 2>/dev/null || return
+
+    case "$key" in
+    p | P)
+        if [[ "$INTERACTIVE_MODE" == "TRUE" ]]; then
+            restore_terminal_state
+            "$VM_SCRIPT"
+            enter_monitor_mode
+        fi
+        ;;
+    q | Q)
+        cleanup
+        exit 0
+        ;;
+    esac
+}
+
+cleanup() {
+    move_cursor_home
+    tput ed
+    restore_terminal_state
+    printf "%b" "$C_RESET"
+}
+
+trap cleanup EXIT INT TERM
+
+main() {
+    ORIGINAL_STTY=$(stty -g 2>/dev/null || true)
+
+    init_gpu_info
+    clear_screen
+    enter_monitor_mode
+
+    while true; do
+        draw_ui
+        for ((i = 0; i < REFRESH_RATE * 10; i++)); do
+            handle_input || true
+            sleep 0.1
+        done
+    done
+}
+
+main "$@"
