@@ -2,7 +2,7 @@
 
 VM_HOST="$VMGPUTOP_HOST"       # add to your env: export VMGPUTOP_HOST="user@ip"
 VM_LOGPATH="$VMGPUTOP_LOGPATH" # path to log file on VM
-INTERACTIVE_MODE=TRUE          # if using power-mode/Afterburner profile toggle
+INTERACTIVE_MODE=FALSE         # if using power-mode/Afterburner profile toggle
 VM_SCRIPT="$VMGPUTOP_SCRIPT"   # if using INTERACTIVE_MODE
 MEM_CLOCK_MULTIPLIER=4         # GDDR6 effective rate multiplier
 MEM_CLOCK_BOOST=500            # Manual memory overclock (MHz, added to max)
