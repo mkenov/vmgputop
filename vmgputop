@@ -2,7 +2,7 @@
 
 VM_HOST="$VMGPUTOP_HOST"       # add to your env: export VMGPUTOP_HOST="user@ip"
 VM_LOGPATH="$VMGPUTOP_LOGPATH" # path to log file on VM
-INTERACTIVE_MODE=FALSE         # if using power-mode/Afterburner profile toggle
+INTERACTIVE_MODE=TRUE          # if using power-mode/Afterburner profile toggle
 VM_SCRIPT="$VMGPUTOP_SCRIPT"   # if using INTERACTIVE_MODE
 MEM_CLOCK_MULTIPLIER=4         # GDDR6 effective rate multiplier
 MEM_CLOCK_BOOST=500            # Manual memory overclock (MHz, added to max)
@@ -147,7 +147,7 @@ init_gpu_info() {
 
 fetch_gpu_stats() {
     # CSV columns: Date[0],Time[1],Temp[2],ThermalLimit[3],Voltage[4],FanRPM[5],Power[6],
-    #              GPUClock[7],MemClock[8],Fan%[9],MemAvail[10],MemAlloc[11],GPULoad[12]
+    #              GPUClock[7],MemClock[8],GPULoad[12],Fan%[9],MemAvail[10],MemAlloc[11]
     local csv_line
     csv_line=$(ssh -q "$VM_HOST" "powershell -NoProfile -Command \"(Get-Content $VM_LOGPATH -Tail 1)\"" 2>/dev/null | tr -d '\r') || true
 
