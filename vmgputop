@@ -1,28 +1,22 @@
 #!/usr/bin/env bash
 
-VM_HOST="$VMGPUTOP_HOST"       # add to your env: export VMGPUTOP_HOST="user@ip"
-VM_LOGPATH="$VMGPUTOP_LOGPATH" # path to log file on VM
-INTERACTIVE_MODE=FALSE         # if using power-mode/Afterburner profile toggle
-VM_SCRIPT="$VMGPUTOP_SCRIPT"   # if using INTERACTIVE_MODE
-MEM_CLOCK_MULTIPLIER=4         # GDDR6 effective rate multiplier
-MEM_CLOCK_BOOST=500            # Manual memory overclock (MHz, added to max)
-REFRESH_RATE=1
-VOLTAGE_MIN=0.7
-VOLTAGE_MAX=0.97
-TEMP_MIN=35
-ORIGINAL_STTY=""
-BOX_INNER_WIDTH=47
-HORIZONTAL_CHAR="─"
-BAR_WIDTH=22
+load_config() {
+    local script_dir config_file
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-C_RESET="\033[0m"
-C_FG="\033[38;2;$(printf "%d;%d;%d" 0x${FG:1:2} 0x${FG:3:2} 0x${FG:5:2})m"
-C_AQUA="\033[38;2;$(printf "%d;%d;%d" 0x${AQUA:1:2} 0x${AQUA:3:2} 0x${AQUA:5:2})m"
-C_GREEN="\033[38;2;$(printf "%d;%d;%d" 0x${GREEN:1:2} 0x${GREEN:3:2} 0x${GREEN:5:2})m"
-C_YELLOW="\033[38;2;$(printf "%d;%d;%d" 0x${YELLOW:1:2} 0x${YELLOW:3:2} 0x${YELLOW:5:2})m"
-C_RED="\033[38;2;$(printf "%d;%d;%d" 0x${RED:1:2} 0x${RED:3:2} 0x${RED:5:2})m"
-C_ORANGE="\033[38;2;$(printf "%d;%d;%d" 0x${ORANGE:1:2} 0x${ORANGE:3:2} 0x${ORANGE:5:2})m"
-C_DIM="\033[38;2;$(printf "%d;%d;%d" 0x${BG4:1:2} 0x${BG4:3:2} 0x${BG4:5:2})m"
+    if [[ -f "${HOME}/.config/vmgputop/config.env" ]]; then
+        config_file="${HOME}/.config/vmgputop/config.env"
+    elif [[ -f "${script_dir}/example.env" ]]; then
+        config_file="${script_dir}/example.env"
+    else
+        printf "Error: No config file found.\n" >&2
+        printf "Create ~/.config/vmgputop/config.env or copy example.env\n" >&2
+        exit 1
+    fi
+
+    # shellcheck source=/dev/null
+    source "$config_file"
+}
 
 top_border() {
     local title="$1"
@@ -105,21 +99,19 @@ render_bar() {
     printf "%s" "$bar"
 }
 
-# Color based on percentage (temp, utilization, etc.)
 color_by_percent() {
     local val=$1
-    if [[ $val -ge 80 ]]; then
+    if [[ $val -ge $C_1 ]]; then
         echo "$C_RED"
-    elif [[ $val -ge 60 ]]; then
+    elif [[ $val -ge $C_2 ]]; then
         echo "$C_ORANGE"
-    elif [[ $val -ge 40 ]]; then
+    elif [[ $val -ge $C_3 ]]; then
         echo "$C_YELLOW"
     else
         echo "$C_GREEN"
     fi
 }
 
-# Fetch static GPU info from nvidia-smi
 init_gpu_info() {
     local gpu_info
     gpu_info=$(ssh -q "$VM_HOST" "nvidia-smi --query-gpu=name,power.max_limit,clocks.max.graphics,clocks.max.memory --format=csv,noheader" 2>/dev/null | tr -d '\r') || true
@@ -145,26 +137,104 @@ init_gpu_info() {
     fi
 }
 
+declare -A CSV_COL
+CSV_MAP_READY="FALSE"
+
+csv_trim() {
+    local s="$1"
+    s=${s%$'\r'}
+    s=${s#\"}
+    s=${s%\"}
+    s=$(echo "$s" | xargs)
+    printf "%s" "$s"
+}
+
+init_csv_mapping() {
+    local header_line
+    header_line=$(ssh -q "$VM_HOST" "powershell -NoProfile -Command \"(Get-Content -Path '$VM_LOGPATH' -TotalCount 1)\"" 2>/dev/null | tr -d '\r') || true
+    [[ -z "$header_line" ]] && CSV_MAP_READY="FALSE" && return 1
+
+    local -a headers
+    IFS=',' read -r -a headers <<<"$header_line"
+
+    CSV_COL=()
+    for i in "${!headers[@]}"; do
+        local h
+        h=$(csv_trim "${headers[$i]}")
+
+        # Exact match against HW_* config variables
+        case "$h" in
+        "$HW_TEMP") CSV_COL[temp]="$i" ;;
+        "$HW_THERMAL_LIMIT") CSV_COL[thermal_limit]="$i" ;;
+        "$HW_VOLTAGE") CSV_COL[voltage]="$i" ;;
+        "$HW_FAN_RPM") CSV_COL[fan_rpm]="$i" ;;
+        "$HW_POWER_DRAW") CSV_COL[power_draw]="$i" ;;
+        "$HW_GPU_CLOCK") CSV_COL[gpu_clock]="$i" ;;
+        "$HW_MEM_CLOCK") CSV_COL[mem_clock]="$i" ;;
+        "$HW_GPU_LOAD") CSV_COL[gpu_load]="$i" ;;
+        "$HW_FAN_PERCENT") CSV_COL[fan_percent]="$i" ;;
+        "$HW_MEM_AVAILABLE") CSV_COL[mem_available]="$i" ;;
+        "$HW_MEM_ALLOCATED") CSV_COL[mem_allocated]="$i" ;;
+        esac
+    done
+
+    local -a required_keys=(temp thermal_limit voltage fan_rpm power_draw gpu_clock mem_clock gpu_load fan_percent)
+    for key in "${required_keys[@]}"; do
+        if [[ -z "${CSV_COL[$key]+set}" ]]; then
+            CSV_MAP_READY="FALSE"
+            return 1
+        fi
+    done
+
+    CSV_MAP_READY="TRUE"
+}
+
 fetch_gpu_stats() {
-    # CSV columns: Date[0],Time[1],Temp[2],ThermalLimit[3],Voltage[4],FanRPM[5],Power[6],
-    #              GPUClock[7],MemClock[8],GPULoad[12],Fan%[9],MemAvail[10],MemAlloc[11]
+    # Pull the same stats as before, but locate columns by the CSV header.
     local csv_line
-    csv_line=$(ssh -q "$VM_HOST" "powershell -NoProfile -Command \"(Get-Content $VM_LOGPATH -Tail 1)\"" 2>/dev/null | tr -d '\r') || true
+    csv_line=$(ssh -q "$VM_HOST" "powershell -NoProfile -Command \"(Get-Content -Path '$VM_LOGPATH' -Tail 1)\"" 2>/dev/null | tr -d '\r') || true
 
-    IFS=',' read -r _date _time temp thermal_limit voltage fan_rpm power_draw gpu_clock mem_clock gpu_load fan_percent mem_available mem_allocated _rest <<<"$csv_line"
+    if [[ "$CSV_MAP_READY" != "TRUE" ]]; then
+        init_csv_mapping || true
+    fi
 
-    # Clean up values
-    temp=$(echo "$temp" | xargs)
-    thermal_limit=$(echo "$thermal_limit" | xargs)
-    voltage=$(echo "$voltage" | xargs)
-    fan_rpm=$(echo "$fan_rpm" | xargs)
-    power_draw=$(echo "$power_draw" | xargs)
-    gpu_clock=$(echo "$gpu_clock" | xargs)
-    mem_clock=$(echo "$mem_clock" | xargs)
-    fan_percent=$(echo "$fan_percent" | xargs)
-    mem_available=$(echo "$mem_available" | xargs)
-    mem_allocated=$(echo "$mem_allocated" | xargs)
-    gpu_load=$(echo "$gpu_load" | xargs)
+    local -a fields
+    IFS=',' read -r -a fields <<<"$csv_line"
+
+    local idx
+
+    idx=${CSV_COL[temp]-}
+    [[ "$idx" =~ ^[0-9]+$ ]] && temp=$(csv_trim "${fields[$idx]-}") || temp=0
+
+    idx=${CSV_COL[thermal_limit]-}
+    [[ "$idx" =~ ^[0-9]+$ ]] && thermal_limit=$(csv_trim "${fields[$idx]-}") || thermal_limit=0
+
+    idx=${CSV_COL[voltage]-}
+    [[ "$idx" =~ ^[0-9]+$ ]] && voltage=$(csv_trim "${fields[$idx]-}") || voltage=0
+
+    idx=${CSV_COL[fan_rpm]-}
+    [[ "$idx" =~ ^[0-9]+$ ]] && fan_rpm=$(csv_trim "${fields[$idx]-}") || fan_rpm=0
+
+    idx=${CSV_COL[power_draw]-}
+    [[ "$idx" =~ ^[0-9]+$ ]] && power_draw=$(csv_trim "${fields[$idx]-}") || power_draw=0
+
+    idx=${CSV_COL[gpu_clock]-}
+    [[ "$idx" =~ ^[0-9]+$ ]] && gpu_clock=$(csv_trim "${fields[$idx]-}") || gpu_clock=0
+
+    idx=${CSV_COL[mem_clock]-}
+    [[ "$idx" =~ ^[0-9]+$ ]] && mem_clock=$(csv_trim "${fields[$idx]-}") || mem_clock=0
+
+    idx=${CSV_COL[gpu_load]-}
+    [[ "$idx" =~ ^[0-9]+$ ]] && gpu_load=$(csv_trim "${fields[$idx]-}") || gpu_load=0
+
+    idx=${CSV_COL[fan_percent]-}
+    [[ "$idx" =~ ^[0-9]+$ ]] && fan_percent=$(csv_trim "${fields[$idx]-}") || fan_percent=0
+
+    idx=${CSV_COL[mem_available]-}
+    [[ "$idx" =~ ^[0-9]+$ ]] && mem_available=$(csv_trim "${fields[$idx]-}") || mem_available=1
+
+    idx=${CSV_COL[mem_allocated]-}
+    [[ "$idx" =~ ^[0-9]+$ ]] && mem_allocated=$(csv_trim "${fields[$idx]-}") || mem_allocated=0
 
     # Validate
     [[ ! "$temp" =~ ^[0-9]+\.?[0-9]*$ ]] && temp=0
@@ -262,7 +332,7 @@ draw_ui() {
         "$temp_bar" \
         "$thermal_limit"
     draw_line " ${C_FG}│ ${C_DIM}%-8s${C_FG}%8s %s ${fan_color}%4s%%${C_FG} │${C_RESET} " \
-        "Fan" \
+        "Fans" \
         "$fan_rpm_display" \
         "$fan_bar" \
         "$fan_percent"
@@ -272,7 +342,7 @@ draw_ui() {
         "$gpu_bar" \
         "$gpu_load"
     draw_line " ${C_FG}│ ${C_DIM}%-8s${C_FG}%8s %s ${mem_color}%4s%%${C_FG} │${C_RESET} " \
-        "Mem" \
+        "Memory" \
         "${mem_used_gb}/${mem_total_gb}G" \
         "$mem_bar" \
         "$mem_percent"
@@ -287,7 +357,7 @@ draw_ui() {
         "$power_bar" \
         "$power_percent"
     draw_line " ${C_FG}│ ${C_DIM}%-8s${C_FG}%8s %s ${voltage_color}%4s%%${C_FG} │${C_RESET} " \
-        "Volt" \
+        "Voltage" \
         "$voltage_display" \
         "$voltage_bar" \
         "$voltage_percent"
@@ -298,13 +368,12 @@ draw_ui() {
 
 # Get power mode status [INTERACTIVE_MODE]
 get_power_mode() {
-    if grep -qw "performance" /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null; then
-        echo "Boost"
+    if grep -qw $VM_CPUFREQ_MARKER $VM_CPUFREQ 2>/dev/null; then
+        echo $VM_BOOST
     else
-        echo "Light"
+        echo $VM_LIGHT
     fi
 }
-
 handle_input() {
     local key
     read -t 0.01 -n 1 key 2>/dev/null || return
@@ -334,6 +403,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 main() {
+    load_config
     ORIGINAL_STTY=$(stty -g 2>/dev/null || true)
 
     init_gpu_info
