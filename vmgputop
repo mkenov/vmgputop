@@ -145,6 +145,8 @@ csv_trim() {
     s=${s%$'\r'}
     s=${s#\"}
     s=${s%\"}
+    s=${s//Â/}
+    s=${s//$'\xf8'/°}  # Latin-1 degree to UTF-8
     s=$(echo "$s" | xargs)
     printf "%s" "$s"
 }
